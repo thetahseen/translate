@@ -4,8 +4,9 @@ import json
 import os
 from typing import Any, Optional
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 import time
+from collections import defaultdict
 
 from base_plugin import BasePlugin, MethodReplacement, HookResult, HookStrategy
 from hook_utils import find_class
@@ -18,8 +19,12 @@ from ui.settings import Header, Input, Selector, Divider, Text, Switch
 
 DEBUG_TRANSLATION_LOGS = True
 
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="translator_")
+
 _session = None
-_executor = ThreadPoolExecutor(max_workers=50, thread_name_prefix="translator_")
+
+_in_flight_translations = {}  # key -> Future mapping
+_in_flight_lock = __import__('threading').Lock()
 
 CACHE_DIR = os.path.expanduser("~/.ayugram_plugin_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -33,9 +38,26 @@ in_progress_messages = set()
 _translation_cache = {}
 _cache_dirty = False
 _cache_last_save = 0
-_cache_save_interval = 30
+_cache_save_interval = 60
 
 _plugin_instance = None
+
+_request_cache = {}  # text_lang_key -> result/pending
+_request_lock = __import__('threading').Lock()
+
+_visible_message_ids = set()
+_viewport_lock = __import__('threading').Lock()
+
+def update_visible_messages(visible_ids):
+    """Update which messages are currently visible on screen."""
+    global _visible_message_ids
+    with _viewport_lock:
+        _visible_message_ids = set(visible_ids) if visible_ids else set()
+
+def is_message_visible(message_id):
+    """Check if a message is currently visible on screen."""
+    with _viewport_lock:
+        return message_id in _visible_message_ids
 
 def load_cache():
     """Load translations cache from file into memory only once."""
@@ -90,9 +112,7 @@ def is_online() -> bool:
 
 def get_cache_key(text: str, target_lang: str) -> str:
     """Generate cache key from text and target language."""
-    import hashlib
-    text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-    return f"{text_hash}_{target_lang}"
+    return f"{text[:50]}_{target_lang}"
 
 def get_cache_size():
     """Get the size of the translations cache in KB."""
@@ -222,6 +242,57 @@ def is_already_translated(original_text: str, target_lang_code: str) -> bool:
     
     return False
 
+def normalize_language_code(lang_code: str) -> str:
+    """
+    Normalize language code matching Telegram's conversion.
+    Handles: nb->no, strips region suffix (zh_CN -> zh), etc.
+    """
+    if not lang_code:
+        return "en"
+    
+    base_lang = lang_code.split("_")[0].lower()
+    
+    if base_lang == "nb":
+        return "no"
+    
+    return base_lang
+
+def preserve_entities(original_text: str, translated_text: str) -> str:
+    """
+    Preserve entities (links, emojis, formatting) from original translation.
+    Matches Telegram's TranslateAlert2.preprocess() behavior.
+    """
+    try:
+        import re
+        
+        # Extract URLs from original text
+        url_pattern = r'(https?://[^\s]+)'
+        original_urls = re.findall(url_pattern, original_text)
+        translated_urls = re.findall(url_pattern, translated_text)
+        
+        # If translation accidentally removed URLs, restore them
+        if original_urls and not translated_urls:
+            for url in original_urls:
+                if url not in translated_text:
+                    # Add URL to end if not present
+                    translated_text += f" {url}"
+        
+        # Preserve emoji patterns (Unicode ranges)
+        emoji_pattern = r'[\U0001F300-\U0001F9FF]+'
+        
+        # Don't remove/change emojis in translation
+        original_emojis = set(re.findall(emoji_pattern, original_text))
+        translated_emojis = set(re.findall(emoji_pattern, translated_text))
+        
+        # If emojis were lost, preserve them from original at end
+        missing_emojis = original_emojis - translated_emojis
+        if missing_emojis:
+            translated_text += "".join(missing_emojis)
+        
+        return translated_text
+    except Exception as e:
+        log(f"[ENTITY] Error preserving entities: {e}")
+        return translated_text
 
 class BeforeHookedTrue:
     def before_hooked_method(self, param):
@@ -267,16 +338,13 @@ class AdvancedTranslatorPlugin(BasePlugin, LocalPremiumHook):
         if not JAVA_CLASSES_FOUND:
             BulletinHelper.show_error("Translator: Failed to load (core classes not found).")
             return
-        if self.get_setting("enable_entire_chat_translation", False):
-            try:
-                self.premium_hooking()
-            except Exception as e:
-                log(str(e))
-        else:
-            try:
-                self.premium_unhooking()
-            except Exception as e:
-                log(str(e))
+        
+        try:
+            self.premium_hooking()
+            log("Translator: Premium features unlocked automatically")
+        except Exception as e:
+            log(str(e))
+        
         try:
             target_method = None
             translate_controller_class = TranslateController.getClass()
@@ -315,38 +383,10 @@ class AdvancedTranslatorPlugin(BasePlugin, LocalPremiumHook):
         log("Unloaded")
 
     def _on_premium_toggle(self, value):
-        try:
-            get_messages_controller().getTranslateController().setChatTranslateEnabled(value)
-        except Exception as e:
-            log(f"[TranslateToggle] Failed to sync with Telegram native toggle: {e}")
-        if value:
-            try:
-                self.premium_hooking()
-            except Exception as e:
-                log(str(e))
-        else:
-            try:
-                self.premium_unhooking()
-            except Exception as e:
-                log(str(e))
-        self.reload_settings()
+        pass
 
     def create_settings(self):
         settings_list = []
-        
-        settings_list.append(Divider())
-        settings_list.append(Header(text="Translation Settings"))
-        
-        settings_list.append(
-            Switch(
-                key="enable_entire_chat_translation",
-                text="Translate Entire Chat",
-                default=False,
-                icon="menu_feature_premium",
-                on_change=self._on_premium_toggle,
-                subtext="Automatically translate all messages in your chat.",
-            )
-        )
         
         settings_list.append(Divider())
         settings_list.append(Header(text="Translation Provider"))
@@ -372,28 +412,6 @@ class AdvancedTranslatorPlugin(BasePlugin, LocalPremiumHook):
                 )
             )
         
-        settings_list.append(Divider())
-        settings_list.append(Header(text="Active Language"))
-        
-        current_lang_code = _get_telegram_target_language()
-        current_lang_name = "English"
-        for name, code in LANG_CODE_MAP.items():
-            if code == current_lang_code:
-                current_lang_name = name
-                break
-        
-        settings_list.append(
-            Text(
-                text=f"Current: {current_lang_name}",
-                icon="msg_language",
-            )
-        )
-        settings_list.append(
-            Text(
-                text="(Set via chat translation menu)",
-                icon="msg_info",
-            )
-        )
         
         settings_list.append(Divider())
         settings_list.append(Header(text="Cache Management"))
@@ -468,6 +486,12 @@ class TranslateHook(MethodReplacement):
             if not mo:
                 return None
 
+            message_id = message_object.getId()
+            if not is_message_visible(message_id):
+                if DEBUG_TRANSLATION_LOGS:
+                    log(f"[SKIP] Message {message_id} not visible on screen")
+                return None
+
             # Check if already translated to target language
             if hasattr(mo, 'translatedText') and mo.translatedText is not None:
                 target_lang = _get_telegram_target_language()
@@ -494,7 +518,7 @@ class TranslateHook(MethodReplacement):
             
             in_progress_messages.add(message_key)
             
-            target_lang_code = _get_telegram_target_language()
+            target_lang_code = normalize_language_code(_get_telegram_target_language())
             
             if is_already_translated(original_text, target_lang_code):
                 if DEBUG_TRANSLATION_LOGS:
@@ -502,41 +526,54 @@ class TranslateHook(MethodReplacement):
                 in_progress_messages.discard(message_key)
                 return None
 
-            _executor.submit(
-                self._process_translation,
-                original_text,
-                param,
-                used_message_owner,
-                message_key,
-                target_lang_code,
-                message_object
-            )
+            cache_key = get_cache_key(original_text, target_lang_code)
+            with _request_lock:
+                if cache_key in _request_cache:
+                    # Request already pending or completed
+                    if DEBUG_TRANSLATION_LOGS:
+                        log(f"[DEDUP] Translation in-flight for {cache_key[:20]}")
+                    in_progress_messages.discard(message_key)
+                    return None
+                
+                # Mark as in-flight
+                _request_cache[cache_key] = "PENDING"
+                
+                future = _executor.submit(
+                    self._process_translation,
+                    original_text,
+                    param,
+                    used_message_owner,
+                    message_key,
+                    target_lang_code,
+                    message_object,
+                    cache_key  # Pass cache_key for cleanup
+                )
 
         except Exception as e:
             self._handle_error(e, "replace_hooked_method")
         return None
 
-    def _handle_error(self, e: Exception, context: str):
-        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ReadTimeout)):
-            if DEBUG_TRANSLATION_LOGS:
-                log(f"[OFFLINE] Translation unavailable ({context})")
-            return
-        
-        error_message = f"Translator Error ({context}):\n\n{type(e).__name__}: {e}\n\nTraceback:\n{traceback.format_exc()}"
-        log(error_message)
-        if DEBUG_TRANSLATION_LOGS:
-            run_on_ui_thread(lambda: self._show_error_dialog(error_message))
-
-    def _process_translation(self, original_text: str, param: Any, used_message_owner: bool, message_key: str, target_lang_code: str, message_object=None):
+    def _process_translation(self, original_text: str, param: Any, used_message_owner: bool, message_key: str, target_lang_code: str, message_object=None, cache_key=None):
         """Main translation processing - stores in NATIVE Telegram storage."""
         try:
-            cache_key = get_cache_key(original_text, target_lang_code)
+            if not cache_key:
+                cache_key = get_cache_key(original_text, target_lang_code)
+            
+            if not is_message_visible(message_object.getId()):
+                if DEBUG_TRANSLATION_LOGS:
+                    log(f"[SKIP] Message became invisible during processing")
+                in_progress_messages.discard(message_key)
+                return
+            
             cache_data = load_cache()
             
             if cache_key in cache_data:
                 cached_translation = cache_data[cache_key]
                 if DEBUG_TRANSLATION_LOGS:
-                    log(f"[CACHE HIT]")
+                    log(f"[CACHE HIT] {cache_key[:20]}")
+                
+                cached_translation = preserve_entities(original_text, cached_translation)
+                
                 self._store_translation_in_native_storage(
                     message_object,
                     cached_translation,
@@ -572,6 +609,8 @@ class TranslateHook(MethodReplacement):
                 in_progress_messages.discard(message_key)
                 return
 
+            translated_text = preserve_entities(original_text, translated_text)
+
             cache_data[cache_key] = translated_text
             save_cache(cache_data)
             
@@ -589,6 +628,9 @@ class TranslateHook(MethodReplacement):
 
         finally:
             in_progress_messages.discard(message_key)
+            if cache_key:
+                with _request_lock:
+                    _request_cache.pop(cache_key, None)
 
     def _store_translation_in_native_storage(self, message_object, translated_text: str, target_lang_code: str):
         """
@@ -634,8 +676,14 @@ class TranslateHook(MethodReplacement):
                 "https://clients5.google.com/translate_a/t",
                 params=params,
                 headers=headers,
-                timeout=3
+                timeout=1.0
             )
+            
+            if response.status_code == 429:
+                if DEBUG_TRANSLATION_LOGS:
+                    log("[GOOGLE] Rate limited (429)")
+                return None
+            
             response.raise_for_status()
             result = response.json()
             if result and isinstance(result, list) and result[0] and isinstance(result[0], list):
@@ -652,7 +700,13 @@ class TranslateHook(MethodReplacement):
             params = {"text": text, "language": target_lang}
             headers = {"User-Agent": get_random_user_agent()}
             
-            response = get_session().get(url, params=params, headers=headers, timeout=5)
+            response = get_session().get(url, params=params, headers=headers, timeout=1.2)
+            
+            if response.status_code == 429:
+                if DEBUG_TRANSLATION_LOGS:
+                    log("[DELIRIUS] Rate limited (429)")
+                return None
+            
             response.raise_for_status()
             data = response.json()
             
@@ -680,7 +734,13 @@ class TranslateHook(MethodReplacement):
                 "User-Agent": get_random_user_agent(),
             }
             data = {"text": text, "target_lang": deepl_target}
-            response = get_session().post(url, headers=headers, data=data, timeout=4)
+            
+            response = get_session().post(url, headers=headers, data=data, timeout=1.2)
+            
+            if response.status_code == 429:
+                if DEBUG_TRANSLATION_LOGS:
+                    log("[DEEPL] Rate limited (429)")
+                return None
             
             if response.status_code == 200:
                 resp_json = response.json()
@@ -728,8 +788,8 @@ def get_session():
     if _session is None:
         _session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=100,
-            pool_maxsize=100,
+            pool_connections=8,
+            pool_maxsize=8,
             max_retries=0
         )
         _session.mount('http://', adapter)
@@ -766,6 +826,6 @@ __name__ = "TranslatorPlus"
 __description__ = "Ultra-fast multi-provider translation for Telegram"
 __icon__ = "luvztroyicons/1"
 __id__ = "translatorplus"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "@xwvux"
 __min_version__ = "11.12.0"
